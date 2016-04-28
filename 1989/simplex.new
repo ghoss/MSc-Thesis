@@ -1,0 +1,1119 @@
+/****************************************************************
+*
+*           S O F T W A R E   S O U R C E   F I L E
+*
+*****************************************************************
+*
+*   Name of file   : simplex.c
+*   Author         : Guido Hoss
+*   Creation Date  : 26/04/89
+*   Type of file   : C Language File
+*
+*   Description
+*   -----------
+*   Simplex optimization algorithm. The implementation follows 
+*   the program example in Schwarz: "Numerische Mathematik", Teubner
+*   1986, p.67. Refer to this book for details.
+*
+*   MODIFIED VERSION OF THE ORIGINAL SIMPLEX.C FILE. Used here only
+*   to find bad situations and stopwords.
+*
+*   Call Format
+*   -----------
+*	optimize <doc-descr> <concepts> <relevant> <atom-wgts> [QUIET]
+*
+*   where <doc-descr> contains the weights of each sign in each
+*   document, <concepts> is the list of atomic concepts associated 
+*   with each sign, and <relevant> contains all relevant documents
+*   for each query. <atom-wgts> contains the initial IDF of the
+*   atomic weights.
+*
+*   The optimized weights are written to the standard output.
+*
+*   If the string QUIET is specified as the last parameter,
+*   running counts are not written to the screen.
+*
+*****************************************************************
+*
+*   COPYRIGHT (C) 1989, 2016 BY GUIDO HOSS.
+*
+*   This program is free software: you can redistribute it and/or 
+*   modify it under the terms of the GNU General Public License
+*   as published by the Free Software Foundation, either version 3
+*   of the License, or (at your option) any later version.
+*
+*   This program is distributed in the hope that it will be useful,
+*   but WITHOUT ANY WARRANTY; without even the implied warranty of
+*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*   GNU General Public License for more details.
+*
+*   You should have received a copy of the GNU General Public
+*   License along with this program.  If not, see
+*   <http://www.gnu.org/licenses/>.
+*
+*   Git repository home: <https://github.com/ghoss/MSc-Thesis>
+*
+*****************************************************************
+* Date        :
+* Description :
+****************************************************************/   
+
+#define PROG	"Atomic Concept Weight Optimization (gh, 04/05/89)\n"
+#define USAGE	"optimize <doc-descr> <concepts> <relevant> <atom-wgts> [QUIET]\n"
+
+#ifdef MSDOS
+#include <process.h>
+#endif
+#include <stdio.h>
+#include <assert.h>
+#include <math.h>
+#include <malloc.h>
+#include <string.h>
+
+#include "boolean.h"
+#include "list.h"
+#include "util.h"
+
+/* Limits */
+#ifdef P10
+#define C2	1.1
+#else
+#ifdef P20
+#define C2	1.2
+#else
+#define C2	2.0
+#endif /* P20 */
+#endif /* P10 */
+
+#define LINE_LENGTH	100
+
+
+typedef
+  struct {
+    int		sign;   /* number of this sign */
+    LIST	atoms;  /* atomic concepts which belong to this sign */
+  } SIGN_STRUCT;
+  
+typedef
+  struct {
+    int		index;		/* number of this document */
+    LIST	docatoms;	/* weights of the atoms occuring in the document */
+    LIST	relevant;	/* Contains all relevant docs if this is query */
+  } DOC_STRUCT;
+
+typedef
+  struct {
+    int		reldoc;		/* number of relevant document */
+  } REL_STRUCT;
+
+typedef
+  struct {
+    int		atom;		/* number of an atomic concept */
+    int		mat_index;	/* col index of the concept's weight in the matrix */
+  } ATOM_STRUCT;
+  
+typedef
+  struct {
+    int		d_atom;		/* number of atom */
+    float	weight;		/* weight of atom in document to which list belongs */
+  } WGT_STRUCT;
+  
+
+int
+  alloc_count = 0;	/* Used for memory overflow message */
+
+LIST
+  unused_wgts, /* list of unused weights */
+  glob_list,   /* global list used by 'calc_rsv' */
+  doc_list,    /* all documents which occur in the EVAL_PREF file */
+  atom_list,   /* all atomic concepts and their matrix indices */
+  sign_list;   /* signs used in documents in the EVAL_PREF file */
+
+int
+  serial,	/* used by 'process_concepts' */
+  num_weights;	/* number of weights to optimize */
+
+
+/* Optimization matrix */
+float
+  **max_weights;	/* ptr to array of RSV equation vectors */
+
+float
+  *temp,	/* pointer to temporary vector */
+  *cost;	/* pointer to vector of cost function */
+
+/* Global variables used for RSV calculation */
+float
+  glob_wgt,
+  *glob_v;
+
+BOOL
+  glob_bool;	/* Used by 'calc_rsv' */
+
+DOC_STRUCT
+  *glob_query;	/* Used by calc_equations */
+  
+FILE
+  *counter;	/* Virtual file used to output running counts */
+
+
+/****************************************************************
+**  relevant
+**
+**  Checks if a document is relevant with respect to a given
+**  query.
+**
+**  IN  : q, d = pointers to records in doc_list of query and document.
+**
+**  OUT : TRUE if document is relevant, FALSE if not.
+****************************************************************/ 
+
+/* Forward declaration */
+int comp_rel ();
+
+BOOL relevant
+       ( q, d )
+DOC_STRUCT
+  *q;
+DOC_STRUCT
+  *d;
+{
+  int
+    doc;
+  REL_STRUCT
+    *rel, t;
+    
+  assert ( q -> relevant != NULL );
+  
+  /* Look for doc in 'relevant' list of query */
+  t.reldoc = d -> index;
+  rel = (REL_STRUCT *) lookup_list ( q -> relevant, (ELEMENT) &t, comp_rel );
+  return ( rel != NULL );
+}
+
+
+/****************************************************************
+**  matrix_index
+**
+**  Returns the column number of an atomic concept in the 
+**  optimization matrix.
+**
+**  IN  : a = atomic concept no.
+**
+**  OUT : The column number of concept 'a'.
+**        If the concept does not occur in the optimization
+**        problem, the function returns (-1).
+****************************************************************/ 
+
+int comp_atom
+      ( s1, s2 )
+ELEMENT
+  s1;
+ELEMENT
+  s2;
+{
+  return ( ((ATOM_STRUCT *) s1) -> atom - ((ATOM_STRUCT *) s2) -> atom );
+}
+
+
+int matrix_index
+      ( a )
+int
+  a;
+{
+  ATOM_STRUCT
+    *atm, temp;
+
+  /* Search 'a' in the atomic concept list */
+  temp.atom = a;
+  atm = (ATOM_STRUCT *) lookup_list ( atom_list, (ELEMENT) &temp, comp_atom );
+  
+  if ( atm != NULL ) {
+    return ( atm -> mat_index );
+  }
+  else {
+    return ( -1 );
+  }
+}
+
+
+/****************************************************************
+**  read_weights
+**
+**  Reads ATOM_WGTS file.
+**
+**  IN  : f = handle to open ATOM_WGTS file.
+**        x = pointer to solution vector of the optimization
+**            problem.
+**
+**  OUT : x is filled with the appropriate IDF values for the
+**        corresponding atoms.
+****************************************************************/ 
+
+void read_weights
+       ( f, x )
+FILE
+  *f;
+float
+  x [];
+{
+  float
+    wgt;
+  int
+    n, idx, index;
+  char
+    line [ LINE_LENGTH ];
+    
+  /* Read file line by line */
+  while ( fgets ( line, LINE_LENGTH, f ) ) {
+  
+    /* Read atom index and weight */
+    n = sscanf ( line, " %d %f", &index, &wgt );
+    assert ( n == 2 );
+    
+    idx = matrix_index ( index );
+    if ( idx != -1 ) {
+      /* concept will be optimized */
+      x [ idx ] = wgt;
+    }
+    else {
+      /* unused concept */
+      printf ( "%d\t%f\n", index, wgt );
+    }
+  }
+}
+
+
+/****************************************************************
+**  read_relevant
+**
+**  Reads the RELEVANT file.
+**
+**  IN  : f = handle to open RELEVANT file.
+****************************************************************/ 
+
+/* Forward declaration */
+int comp_doc ();
+
+int comp_rel
+      ( d1, d2 )
+ELEMENT
+  d1;
+ELEMENT
+  d2;
+{
+  return ( ((REL_STRUCT *) d1) -> reldoc - ((REL_STRUCT *) d2) -> reldoc );
+}
+
+
+void read_relevant
+       ( f )
+FILE
+  *f;
+{
+  DOC_STRUCT
+    *d, t;
+  REL_STRUCT
+    *rel;
+  int
+    n, num;
+  char
+    line [ LINE_LENGTH ];
+  LIST
+    list;
+    
+  /* Read file line by line */
+  while ( fgets ( line, LINE_LENGTH, f ) ) {
+  
+    /* Read a number */
+    n = sscanf ( line, " %d", &num );
+    assert ( n == 1 );
+    
+    /* If number followed by a colon, then this is a query number */
+    if ( strchr ( line, ':' ) != NULL ) {
+      /* Find entry in doc_list with negative index */
+      t.index = -num;
+      d = (DOC_STRUCT *) lookup_list ( doc_list, (ELEMENT) &t, comp_doc );
+      assert ( d != NULL );
+      list = create_list ();
+      assert ( list != NULL );
+      d -> relevant = list;
+      
+      /* running count */
+      fprintf ( counter, "%d\r", num );
+    }
+    else {
+      /* Number of relevant document */
+      rel = (REL_STRUCT *) malloc ( sizeof ( REL_STRUCT ) );
+      assert ( rel != NULL );
+      rel -> reldoc = num;
+      rel = (REL_STRUCT *) add_list ( list, (ELEMENT) rel, comp_rel );
+      assert ( rel != NULL );
+    }
+  }
+}
+
+
+/****************************************************************
+**  process_concepts
+**
+**  Builds a list of signs and atomic concepts of each sign.
+**
+**  IN  : f = handle to the open CONCEPTS file.
+****************************************************************/ 
+
+int comp_sign
+      ( s1, s2 )
+ELEMENT
+  s1;
+ELEMENT
+  s2;
+{
+  return ( ((SIGN_STRUCT *) s1) -> sign - ((SIGN_STRUCT *) s2) -> sign );
+}
+
+
+void process_concepts
+       ( f )
+FILE 
+  *f;
+{
+  char
+    line [ LINE_LENGTH ];
+  SIGN_STRUCT
+    *sgn;
+  LIST
+    list;
+  int
+    d, n;
+  ATOM_STRUCT
+    *atm;
+
+  /* Create list of ALL atomic concepts */
+  sign_list = create_list ();
+  assert ( sign_list != NULL );
+  atom_list = create_list ();
+  assert ( atom_list != NULL );
+  serial = 0;
+
+  /* Read file line by line */
+  while ( fgets ( line, LINE_LENGTH, f ) ) {
+  
+    /* Read a number */
+    n = sscanf ( line, " %d", &d );
+    assert ( n == 1 );
+    
+    /* If number followed by a colon, then this is a sign index */
+    if ( strchr ( line, ':' ) != NULL ) {
+      /* Set sign entry in sign_list */
+      sgn = (SIGN_STRUCT *) malloc ( sizeof ( SIGN_STRUCT ) );
+      assert ( sgn != NULL );
+      sgn -> sign = d;
+      sgn -> atoms = NULL;
+      sgn = (SIGN_STRUCT *) add_list ( sign_list, (ELEMENT) sgn, comp_sign );
+      assert ( sgn != NULL );
+      if ( sgn -> atoms == NULL ) {
+        sgn -> atoms = create_list ();
+        assert ( sgn -> atoms != NULL );
+      }
+      list = sgn -> atoms;
+      
+      /* running count */
+      fprintf ( counter, "%d\r", d );
+    }
+    
+    else if ( d < 0 ) {
+      /* Add atomic concept to concept list of current sign; but only
+         if index is negative (situation concept or stopword concept) */
+      atm = (ATOM_STRUCT *) malloc ( sizeof ( ATOM_STRUCT ) );
+      assert ( atm != NULL );
+      atm -> atom = d;
+      atm = (ATOM_STRUCT *) add_list ( list, (ELEMENT) atm, comp_atom );
+      assert ( atm != NULL );
+      
+      /* Add atom to atom_list, list of all concepts to be optimized */
+      atm = (ATOM_STRUCT *) malloc ( sizeof ( ATOM_STRUCT ) );
+      assert ( atm != NULL );
+      atm -> atom = d;
+      atm -> mat_index = -1;
+      atm = (ATOM_STRUCT *) add_list ( atom_list, (ELEMENT) atm, comp_atom );
+      assert ( atm != NULL );
+      if ( atm -> mat_index == -1 ) {
+        atm -> mat_index = serial;
+        serial ++;
+      }
+    }
+  }
+  
+  fprintf ( counter, "\n" );
+}
+
+
+/****************************************************************
+**  process_documents
+**
+**  Looks at each document description in the DOC_DESCR file;
+**  if the document occurs in a preference relation, then the
+**  sign weights for this document are read. Otherwise, the
+**  document and its signs are ignored.
+**
+**  IN  : f = handle to the open DOC_DESCR file.
+****************************************************************/ 
+
+int comp_doc
+      ( d1, d2 )
+ELEMENT 
+  d1;
+ELEMENT
+  d2;
+{
+  return ( ((DOC_STRUCT *) d1) -> index - ((DOC_STRUCT *) d2) -> index );
+}
+
+
+int comp_wgt
+      ( s1, s2 )
+ELEMENT
+  s1;
+ELEMENT
+  s2;
+{
+  return ( ((WGT_STRUCT *) s1) -> d_atom - ((WGT_STRUCT *) s2) -> d_atom );
+}
+
+
+BOOL make_docatoms
+       ( e )
+ELEMENT 
+  e;
+{
+  WGT_STRUCT
+    *a;
+
+  /* duplicate atom and add to 'glob_list' */
+  a = (WGT_STRUCT *) malloc ( sizeof ( WGT_STRUCT ) );
+  assert ( a != NULL );
+  a -> d_atom = ((ATOM_STRUCT *) e) -> atom;
+  a -> weight = 0.0;
+  a = (WGT_STRUCT *) add_list ( glob_list, (ELEMENT) a, comp_wgt );
+  assert ( a != NULL );
+  
+  /* atom might already have been entered previously, so ADD weight */
+  a -> weight += glob_wgt;
+
+  return ( TRUE );
+}
+
+
+void process_documents
+       ( f )
+FILE 
+  *f;
+{
+  char
+    line [ LINE_LENGTH ];
+  SIGN_STRUCT
+    t, *sgn;
+  DOC_STRUCT
+    *doc;
+  float
+    w;
+  int
+    d, n;
+
+  doc_list = create_list ();
+  assert ( doc_list != NULL );
+  
+  /* Read file line by line */
+  while ( fgets ( line, LINE_LENGTH, f ) ) {
+  
+    /* Interpret as much fields as possible */
+    n = sscanf ( line, " %d %f", &d, &w );
+    switch ( n ) {
+      
+      case 1 :
+        /* One field -> new document number; update running count */
+        fprintf ( counter, "%d\r", d );
+        
+        /* Add document to doc_list */
+        doc = (DOC_STRUCT *) malloc ( sizeof ( DOC_STRUCT ) );
+        assert ( doc != NULL );
+        doc -> index = d;
+        doc -> docatoms = create_list ();
+        doc -> relevant = NULL;
+        assert ( doc -> docatoms != NULL );
+        doc = (DOC_STRUCT *) add_list ( doc_list, (ELEMENT) doc, comp_doc );
+        assert ( doc != NULL );
+        glob_list = doc -> docatoms;
+        break;
+        
+      case 2 :
+        /* Two fields -> sign index and weight *
+        
+        /* Find sign in sign_list */
+        t.sign = d;
+        sgn = (SIGN_STRUCT *) lookup_list ( sign_list, (ELEMENT) &t, comp_sign );
+        assert ( sgn != NULL );
+        
+        /* Add atoms of sign to 'glob_list' */
+        glob_wgt = w;
+        enum_list ( sgn -> atoms, make_docatoms, ENUM_FORWARD );
+        break;
+    }
+  }
+}
+
+
+/****************************************************************
+**  calc_rsv
+**
+**  IN  : d1, d2 = numbers of the two documents
+**        const  = pointer to variable where constant factor 
+**                 of RSV is to be stored.
+**        v      = pointer to vector where factors of individual
+**                 weights are to be stored.
+**
+**  OUT : The vector v is filled with the appropriate values.
+**        The value of the constant factor is returned.
+****************************************************************/
+
+BOOL union_proc
+       ( a1, a2 )
+ELEMENT
+  a1;
+ELEMENT
+  a2;
+{
+  float
+    p;
+  WGT_STRUCT
+    *at1, *at2;
+  int
+    matidx;
+
+  at1 = (WGT_STRUCT *) a1;
+  at2 = (WGT_STRUCT *) a2;
+  assert ( at1 -> d_atom == at2 -> d_atom );
+  
+  /* Multiply weights */
+  p = ( at1 -> weight * at2 -> weight );
+  
+  /* Set vector element of this atomic concept. The atom is not
+     necessarily used. Unused atoms contribute to the constant factor of
+     the RSV vector and are thus unimportant (RSV's only used in cost function) */
+  matidx = matrix_index ( at1 -> d_atom );
+  if ( matidx != -1 ) {
+    glob_v [ matidx ] = p;
+    if ( p != 0.0 ) {
+      glob_bool = TRUE;
+    }
+  }
+  return ( TRUE );
+}
+
+
+BOOL calc_rsv
+       ( q, d, v )
+DOC_STRUCT
+  *q;
+DOC_STRUCT
+  *d;
+float
+  v [];
+{
+  DOC_STRUCT
+    t;
+
+  glob_v = v;
+  glob_bool = FALSE;
+  find_union ( q -> docatoms, d -> docatoms, comp_wgt, union_proc );
+  return ( glob_bool );
+}
+
+
+/****************************************************************
+**  calc_equations
+**
+**  Calculates cost vector and constraint equations.
+**
+**  IN  : x = pointer to vector where element i contains the
+**            IDF for concept i. This is used for the constraint
+**            equations.
+****************************************************************/ 
+
+float *alloc_vector
+	  ( )
+{
+  float 
+    *v;
+
+  /* Note that calloc initializes the vector to zero */
+  v = (float *) calloc ( num_weights + 1, sizeof ( float ) );
+  if ( v == NULL ) {
+    fprintf ( stderr, "Matrix mem alloc failed: vector %d\n", alloc_count );
+    assert ( FALSE );
+  }
+  return ( v );
+}
+
+
+BOOL enum_docs
+       ( e )
+ELEMENT
+  e;
+{
+  DOC_STRUCT
+    *d;
+  float
+    const;
+  BOOL
+    nonzero;
+  int
+    i, doc;
+    
+  d = (DOC_STRUCT *) e;
+  doc = d -> index;
+  
+  if ( doc >= 0 ) {
+    /* document */
+    
+    /* We need temp only once, but it must be initialized to zero before
+       each call to calc_rsv. Calling alloc_vector (->calloc) is a convenient
+       way to do this */
+    temp = alloc_vector ();
+    nonzero = calc_rsv ( glob_query, d, temp );
+
+    if ( nonzero ) {
+      if ( relevant ( glob_query, d ) ) {
+        /* subtract from cost function (that is, add. We are looking for minimum) */
+        for ( i = 0; i < num_weights; i ++ ) {
+          cost [i] += temp [i];
+        }
+        /* We don't add constant factors because they are not important in
+           the cost function */
+      }
+      else {
+        /* add to cost function (that is, subtract. We are looking for minimum) */
+        for ( i = 0; i < num_weights; i ++ ) {
+          cost [i] -= temp [i];
+        }
+      }
+    }
+    free ( temp );
+    return ( TRUE );
+  }
+  else {
+    /* query; stop enumeration here */
+    return ( FALSE );
+  }
+}
+
+
+BOOL enum_queries
+       ( e )
+ELEMENT
+  e;
+{
+  DOC_STRUCT
+    *d;
+    
+  d = (DOC_STRUCT *) e;
+  
+  if ( d -> index < 0 ) {
+    /* query */
+    glob_query = d;
+    enum_list ( doc_list, enum_docs, ENUM_BACKWARD );
+    return ( TRUE );
+  }
+  else {
+    /* document; stop enumeration here */
+    return ( FALSE );
+  }
+}
+
+
+void calc_equations
+       ( x )
+float
+  x [];
+{
+  int
+    i;
+  float
+    *arr;
+        
+  /* Allocate arrays of pointers to vectors */
+  fprintf ( stderr, "   cost\n" );
+  cost = alloc_vector ();
+  enum_list ( doc_list, enum_queries, ENUM_FORWARD );
+  
+  /* High bounds of atomic weights */
+  fprintf ( stderr, "   min/max\n" );
+  max_weights = (float **) calloc ( num_weights, sizeof ( float * ) );
+  assert ( max_weights != NULL );
+
+  for ( i = 0; i < num_weights; i ++ ) {
+    arr = alloc_vector ();
+    arr [i] = -1.0;
+    arr [ num_weights ] = C2 * x [i];
+    max_weights [i] = arr;
+  }
+}
+
+
+/****************************************************************
+**  matrix_ptr
+**
+**  Gets a pointer to the matrix element in (row, col). Used to
+**  simplify the procedures 'elt' and 'set'.
+**  The matrix is interpreted as follows:
+**
+**  row = 0 .. num_weights - 1 : 
+**        maximum weight equations (4.3)
+**
+**  row = num_weights:
+**        cost function (4.1, p.77)
+**
+**  IN  : row, col = row and column of the desired element.
+**
+**  OUT : A pointer to the element is returned.
+****************************************************************/ 
+
+float *matrix_ptr
+          ( row, col )
+int
+  row;
+int
+  col;
+{
+  float
+    *base;
+
+  /* Decrement row and column to map 1..x to 0..x-1 (c array
+     indexing convention */
+  row --;
+  col --;
+  assert ( row >= 0 );
+  assert ( ( col >= 0 ) && ( col <= num_weights ) );
+
+  if ( row < num_weights ) {
+    /* maximum weight constraints */
+    base = max_weights [ row ];
+  }
+  else {
+    /* cost function; this is an array */
+    assert ( row == num_weights );
+    base = cost;
+  }
+  
+  return ( & ( base [ col ] ) );
+}
+
+
+/****************************************************************
+**  elt
+**
+**  Returns the value of an element of the optimization matrix
+**
+**  IN  : row, col = row and column of the element. The first
+**                   row/column index is 0.
+**
+**  OUT : The function returns matrix [ row, col ].
+****************************************************************/ 
+
+#define elt(row,col)	(*matrix_ptr((row),(col)))
+
+
+/****************************************************************
+**  set
+**
+**  Sets the value of an element of the optimization matrix
+**
+**  IN  : row, col = row and column of the element. The first
+**                   row/column index is 0.
+**        value    = new value of the matrix element.
+**                   matrix [ row, col ] := value;
+****************************************************************/ 
+
+#define set(row,col,value)	{ *matrix_ptr((row),(col)) = (value); }
+
+
+/****************************************************************
+**  simplex
+**
+**  Optimization procedure. Processes a system of m constraint
+**  equations with n variables.
+**
+**  The m constraint equations are of the form
+**
+**     y[i] = sum ( k=1..n, a[ik]*x[k] + c[i] ) >= 0. (i=1..m)
+**
+**  The maximum equation z has the form
+**
+**     z = sum ( k=1..n, b[k]*x[k] + d ) = max!
+**
+**  IN  : n = Number of variables to be maximized.
+**        m = Number of constraint equations to be satisfied.
+**        a = Matrix with n+1 columns and m+1 rows. Rows 1..m
+**            contain the m constraint equations y[i]. Row m+1
+**            contains the equation z to be maximized. Columns
+**            1..n contain the coefficients a[ik] (resp. b[k]
+**            in row m+1). Column n+1 contains the constants
+**            c[i] (resp. d in row m+1). The matrix is accessed
+**            with the read procedure 'elt' and the write 
+**            procedure 'set'.
+**        x = Pointer to a real vector of dimension n. This
+**            vector must be initialized with a valid solution
+**            which satisfies the constraint functions.
+**            The solution (0, 0, ..) is valid if all c[i] >= 0.
+**
+**  OUT : If the system has a solution, then the vector x
+**        contains the optimal values of the n variables x[1]..x[n]
+**        and the function returns TRUE.
+**        Otherwise, the function returns FALSE and the contents
+**        of x are invalid.
+****************************************************************/
+
+BOOL simplex
+       ( n, m, x )
+int
+  n;
+int
+  m;
+float
+  x [];
+{
+  int
+    h, i, j, k, p, q, temp2,
+    iterations,
+    *ba,     /* dynamic array, dim n */
+    *nb;     /* dynamic array, dim m */
+  float
+    max,
+    pivot,
+    quot,
+    temp;
+
+  /* Allocate ba and nb vectors; dimension n+1 so we can address
+     from 1..n */
+  ba = (int *) calloc ( n + 1, sizeof ( int ) );
+  assert ( ba != NULL );
+  nb = (int *) calloc ( m + 1, sizeof ( int ) );
+  assert ( nb != NULL );
+
+  /* Initialize 'ba' vector elements 0..n-1 */
+  for ( k = 1; k <= n; k ++ ) {
+    ba [k] = k;
+  }
+
+  /* Initialize 'nb' vector elements 0..m-1 */
+  for ( i = 1; i <= m; i ++ ) {
+    nb [i] = -i;
+  }
+
+#ifndef NDEBUG
+  /* Perform test to see if all c[i] elements positive */
+  for ( i = 1; i <= m; i ++ ) {
+    assert ( elt ( i, n + 1 ) >= 0.0 );
+  }
+#endif
+
+  fprintf ( stderr, "Calculation loop start.\n" );
+  iterations = 0;
+  
+  do {
+    q = 0;
+    max = 0.0;
+
+    /* Step 'PIV' */
+    for ( k = 1; k <= n; k ++ ) {
+      temp = elt ( m + 1, k );
+      if ( temp > max ) {
+        q = k;
+        max = temp;
+      }
+    }
+
+    /* Exit while-loop if q is zero */
+    if ( q == 0 ) break;
+
+    p = 0;
+    max = -99999999999.9;  /* This should read 'minus infinity' */
+    for ( i = 1; i <= m; i ++ ) {
+      temp = elt ( i, q );
+      if ( temp < 0.0 ) {
+        quot = elt ( i, n + 1 ) / temp;
+        if ( quot > max ) {	
+          p = i;
+          max = quot;
+        }
+      }
+    }
+
+    /* If p is zero, the system does not have a solution! */
+    if ( p == 0 ) {
+      return ( FALSE );
+    }
+
+    /* Step 'AT' */
+    h = nb [p];
+    nb [p] = ba [q];
+    ba [q] = h;
+    pivot = elt ( p, q );
+
+    for ( k = 1; k <= n + 1; k ++ ) {
+      if ( k != q ) {
+        set ( p, k, - elt ( p, k ) / pivot );
+        for ( i = 1; i <= m + 1; i ++ ) {
+          if ( i != p ) {
+            set ( i, k, elt (i, k) + elt (i, q) * elt (p, k) );
+          }
+        }
+      }
+    }
+
+    for ( i = 1; i <= m + 1; i ++ ) {
+      set ( i, q, elt ( i, q ) / pivot );
+    }
+
+    set ( p, q, 1.0 / pivot );
+
+    iterations ++;
+  } while ( TRUE );   /* = endless loop */
+
+  /* Step 'LOES' */
+  for ( i = 1; i <= m; i ++ ) {
+    temp2 = nb [i];
+    j = abs ( temp2 );
+    if ( temp2 > 0 ) {
+      x [ j - 1 ] = elt ( i, n + 1 );
+    }
+  }
+
+  fprintf ( stderr, "Iterations: %d\n", iterations );
+  return ( TRUE );
+}
+
+
+/****************************************************************
+**  print_results
+**  
+**  Prints the optimized weights of the atomic concepts in
+**  the correct order.
+**
+**  IN  : x = vector which contains optimized weights.
+****************************************************************/
+
+BOOL enum_results
+       ( a )
+ELEMENT
+  a;
+{
+  ATOM_STRUCT
+    *atm;
+
+  /* The number of an atom is usually not equal to its index in
+     the weight vector */
+  atm = (ATOM_STRUCT *) a;
+  printf ( "%d\t%f\n", atm -> atom, glob_v [ atm -> mat_index ] );
+  return ( TRUE );
+}
+
+
+void print_results
+       ( x )
+float
+  x [];
+{
+  /* glob_v is accessed by enum_results */
+  glob_v = x;
+  enum_list ( atom_list, enum_results, ENUM_FORWARD );
+}
+
+
+/****************************************************************
+**  main
+****************************************************************/
+
+int main
+      ( argc, argv )
+int
+  argc;
+char
+  *argv [];
+{
+  BOOL
+    ok;
+  FILE
+    *f;
+  int
+    i;
+  float
+    *x;   /* Pointer to the (dynamic) solution vector */
+
+  /* Program title */
+  fprintf ( stderr, PROG );
+  fprintf ( stderr, "Special Version\n" );
+
+  /* Get verbose or quiet mode */
+  if ( ( argc == 6 ) && ( *argv [5] == 'Q' ) ) {
+    /* in case of quiet mode: redirect running counts to /dev/null */
+    counter = fopen ( "/dev/null", "r" );
+    assert ( counter != NULL );
+  }
+  else {
+    /* verbose mode: redirect running counts to stderr */
+    counter = stderr;
+  }
+
+  /* Check parameters */
+  if ( argc < 5 ) {
+    fprintf ( stderr, USAGE );
+    return ( 1 );
+  }
+  
+  /* Read atomic concepts of each sign */
+  fprintf ( stderr, "Reading atomic concepts.\n" );
+  f = open_file ( argv [2] );
+  process_concepts ( f );
+  fclose ( f );
+  
+  /* Read documents and calculate weights of atoms in documents */
+  fprintf ( stderr, "Reading document descriptions.\n" );
+  f = open_file ( argv [1] );
+  process_documents ( f );
+  fclose ( f );
+  
+  /* Read relevant document information */
+  fprintf ( stderr, "Reading relevant documents.\n" );
+  f = open_file ( argv [3] );
+  read_relevant ( f );
+  fclose ( f );
+  
+  num_weights = count_list ( atom_list );
+  fprintf ( stderr, "Weights to optimize: %d\n", num_weights );
+
+  /* Read initial atomic weights and output unused */
+  fprintf ( stderr, "Reading initial weights.\n" );
+  x = alloc_vector ();
+  f = open_file ( argv [4] );
+  read_weights ( f, x );
+  
+  /* Calculate optimization matrix */
+  calc_equations ( x );
+  
+  /* Tackle the optimization problem */
+  fprintf ( stderr, "Simplex algorithm.\n" );
+  
+  /* Erase x */
+  free ( x );
+  x = alloc_vector ();
+  ok = simplex ( num_weights, num_weights, x );
+  assert ( ok );
+
+  /* Print results */
+  fprintf ( stderr, "Printing results.\n" );
+  print_results ( x );
+
+  return ( 0 );
+}
