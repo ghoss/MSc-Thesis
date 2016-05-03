@@ -30,7 +30,7 @@
 *   License along with this program.  If not, see
 *   <http://www.gnu.org/licenses/>.
 *
-*   Git repository home: <https://github.com/ghoss/MSc-Thesis>
+*   Git repository home: <https://github.com/ghoss/Thesis>
 *
 *****************************************************************
 * Date        :
